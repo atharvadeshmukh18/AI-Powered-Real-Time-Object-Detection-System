@@ -1,0 +1,30 @@
+# ============================================================
+# AI-Powered Real-Time Object Detection System
+# Requirements File
+# ============================================================
+
+# Core Computer Vision & AI
+ultralytics>=8.0.0          # YOLOv8 framework
+opencv-python>=4.8.0        # OpenCV for video capture & drawing
+numpy>=1.24.0               # Numerical computations
+
+# Voice Assistant
+SpeechRecognition>=3.10.0   # Microphone input / speech-to-text
+pyttsx3>=2.90               # Text-to-speech (offline)
+pyaudio>=0.2.13             # Audio I/O (required by SpeechRecognition)
+
+# Optional: Streamlit Dashboard
+streamlit>=1.28.0           # Web dashboard UI
+streamlit-webrtc>=0.47.0    # Webcam in Streamlit
+
+# Utilities
+Pillow>=10.0.0              # Image processing
+requests>=2.31.0            # HTTP requests (optional alerts)
+python-dotenv>=1.0.0        # Environment variable management
+loguru>=0.7.0               # Enhanced logging
+
+# Optional: Telegram Alerts
+# python-telegram-bot>=20.0
+
+# Optional: Object Tracking
+# lap>=0.4.0                # Required by some trackers
