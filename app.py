@@ -1,264 +1,300 @@
+"""
+app.py — Main Entry Point (Person-Focused)
+==========================================
+Keyboard controls
+-----------------
+  Q / ESC   quit
+  SPACE     pause / resume
+  S         screenshot
+  V         toggle voice
+  + / =     confidence +5%
+  -         confidence -5%
+  0         reset confidence
+
+Run
+---
+  python app.py
+  python app.py --source 1
+  python app.py --source clip.mp4
+  python app.py --no-voice
+  python app.py --conf 0.40
+"""
+
 import cv2
+import os
+import sys
 import time
 import argparse
-import sys
-import os
 from datetime import datetime
 
 from detection import ObjectDetector
 from assistant import VoiceAssistant
 
-
-# ── Default configuration ─────────────────────────────────────────────────────
-DEFAULT_MODEL      = "yolov8n.pt"    # nano model (fastest)
-DEFAULT_CONFIDENCE = 0.40
-DEFAULT_SOURCE     = 0               # 0 = default webcam
-WINDOW_NAME        = "AI Object Detection System"
-OUTPUT_DIR         = "outputs"
+DEFAULT_CONF = 0.35
+WIN          = "AI Object Detection  |  YOLOv8n  |  Person Tracking"
 
 
-# ── CLI argument parser ───────────────────────────────────────────────────────
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="AI Real-Time Object Detection with Voice Assistant"
-    )
-    parser.add_argument(
-        "--source", default=DEFAULT_SOURCE,
-        help="Video source: webcam index (0,1,…) or path to video file"
-    )
-    parser.add_argument(
-        "--model", default=DEFAULT_MODEL,
-        help="Path to YOLOv8 weights (default: yolov8n.pt)"
-    )
-    parser.add_argument(
-        "--conf", type=float, default=DEFAULT_CONFIDENCE,
-        help="Confidence threshold 0–1 (default: 0.40)"
-    )
-    parser.add_argument(
-        "--no-voice", action="store_true",
-        help="Disable voice assistant"
-    )
-    parser.add_argument(
-        "--width", type=int, default=1280,
-        help="Capture width in pixels"
-    )
-    parser.add_argument(
-        "--height", type=int, default=720,
-        help="Capture height in pixels"
-    )
-    return parser.parse_args()
+def build_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--source",   default=0)
+    p.add_argument("--model",    default="yolov8n.pt")
+    p.add_argument("--conf",     type=float, default=DEFAULT_CONF)
+    p.add_argument("--no-voice", action="store_true")
+    p.add_argument("--width",    type=int, default=1280)
+    p.add_argument("--height",   type=int, default=720)
+    return p.parse_args()
 
 
-# ── Video source helper ───────────────────────────────────────────────────────
-def open_source(source) -> cv2.VideoCapture:
-    """
-    Open a webcam or video file.
-    Tries to convert the source to int (for webcam index) first.
-    """
-    try:
-        src = int(source)
-    except (ValueError, TypeError):
-        src = str(source)   # treat as file path
+# ── Overlay helpers ───────────────────────────────────────────────────────────
 
-    cap = cv2.VideoCapture(src)
-    if not cap.isOpened():
-        print(f"[App] ERROR: Could not open video source: {source}")
-        sys.exit(1)
-    return cap
-
-
-# ── Main application ──────────────────────────────────────────────────────────
-def main() -> None:
-    args = parse_args()
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    os.makedirs("screenshots", exist_ok=True)
-
-    print("=" * 60)
-    print("  AI Real-Time Object Detection System")
-    print(f"  Model      : {args.model}")
-    print(f"  Source     : {args.source}")
-    print(f"  Confidence : {args.conf}")
-    print(f"  Voice      : {'disabled' if args.no_voice else 'enabled'}")
-    print("=" * 60)
-
-    # ── 1. Initialise detector ────────────────────────────────────────────────
-    detector = ObjectDetector(
-        model_path=args.model,
-        confidence_threshold=args.conf,
-        screenshot_dir="screenshots",
-        screenshot_interval=30,
-    )
-
-    # ── 2. Initialise voice assistant ─────────────────────────────────────────
-    detection_active = [True]    # mutable flag shared with callbacks
-
-    def on_start():
-        detection_active[0] = True
-        print("[App] Detection STARTED via voice.")
-
-    def on_stop():
-        detection_active[0] = False
-        print("[App] Detection PAUSED via voice.")
-
-    def on_screenshot():
-        # Force a screenshot by resetting the cooldown
-        detector._last_screenshot_time = 0
-
-    assistant = None
-    if not args.no_voice:
-        assistant = VoiceAssistant(
-            detector=detector,
-            on_start=on_start,
-            on_stop=on_stop,
-            on_screenshot=on_screenshot,
-        )
-        assistant.start()
-    else:
-        print("[App] Voice assistant disabled.")
-
-    # ── 3. Open video source ──────────────────────────────────────────────────
-    cap = open_source(args.source)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-
-    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"[App] Capture resolution: {actual_w} × {actual_h}")
-
-    # ── 4. OpenCV window setup ─────────────────────────────────────────────────
-    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WINDOW_NAME, actual_w, actual_h)
-
-    # Confidence trackbar
-    def on_conf_change(val):
-        detector.set_confidence(val / 100.0)
-
-    cv2.createTrackbar("Confidence %", WINDOW_NAME, int(args.conf * 100), 95, on_conf_change)
-
-    print("[App] Window ready. Press Q to quit, SPACE to toggle detection.")
-
-    # ── 5. Main loop ──────────────────────────────────────────────────────────
-    voice_active = not args.no_voice
-    frame_count  = 0
-    paused_frame = None          # shown when detection is paused
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            # For video files: loop back; for webcam: error
-            if isinstance(args.source, str) and os.path.isfile(str(args.source)):
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                continue
-            print("[App] Failed to grab frame. Exiting.")
-            break
-
-        frame_count += 1
-
-        # ── Detect or show paused overlay ─────────────────────────────────
-        if detection_active[0]:
-            display_frame, counts = detector.process_frame(frame)
-            paused_frame = display_frame.copy()   # cache for pause
-        else:
-            # Detection paused — show last frame with "PAUSED" banner
-            display_frame = _draw_paused_overlay(
-                paused_frame if paused_frame is not None else frame
-            )
-
-        # ── Show frame ─────────────────────────────────────────────────────
-        cv2.imshow(WINDOW_NAME, display_frame)
-
-        # ── Keyboard handling ──────────────────────────────────────────────
-        key = cv2.waitKey(1) & 0xFF
-
-        if key == ord("q") or key == 27:        # Q or ESC → quit
-            print("[App] Quitting...")
-            break
-
-        elif key == ord("s"):                    # S → manual screenshot
-            _save_manual_screenshot(display_frame)
-
-        elif key == ord(" "):                    # SPACE → toggle detection
-            detection_active[0] = not detection_active[0]
-            state = "STARTED" if detection_active[0] else "PAUSED"
-            print(f"[App] Detection {state}.")
-
-        elif key == ord("v") and assistant:      # V → toggle voice
-            if voice_active:
-                assistant.stop()
-                voice_active = False
-                print("[App] Voice assistant OFF.")
-            else:
-                assistant.start()
-                voice_active = True
-                print("[App] Voice assistant ON.")
-
-        elif key in (ord("+"), ord("=")):        # + → raise confidence
-            detector.set_confidence(detector.confidence_threshold + 0.05)
-            cv2.setTrackbarPos("Confidence %", WINDOW_NAME,
-                               int(detector.confidence_threshold * 100))
-
-        elif key == ord("-"):                    # - → lower confidence
-            detector.set_confidence(detector.confidence_threshold - 0.05)
-            cv2.setTrackbarPos("Confidence %", WINDOW_NAME,
-                               int(detector.confidence_threshold * 100))
-
-        elif key == ord("0"):                    # 0 → reset confidence
-            detector.set_confidence(DEFAULT_CONFIDENCE)
-            cv2.setTrackbarPos("Confidence %", WINDOW_NAME,
-                               int(DEFAULT_CONFIDENCE * 100))
-
-        # Window closed by user (X button)
-        if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
-            break
-
-    # ── Cleanup ────────────────────────────────────────────────────────────────
-    cap.release()
-    cv2.destroyAllWindows()
-    if assistant:
-        assistant.stop()
-    print("[App] Resources released. Goodbye!")
-
-
-# ── Helper functions ──────────────────────────────────────────────────────────
-
-def _draw_paused_overlay(frame) -> None:
-    """Dim the frame and print a PAUSED banner."""
-    import numpy as np
-    overlay = frame.copy()
-    # Darken entire frame
-    cv2.rectangle(overlay, (0, 0), (frame.shape[1], frame.shape[0]),
-                  (0, 0, 0), cv2.FILLED)
-    frame = cv2.addWeighted(overlay, 0.5, frame, 0.5, 0)
-
+def draw_paused(frame):
     h, w = frame.shape[:2]
-    text = "DETECTION PAUSED"
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = 1.5
-    thick = 3
-    (tw, th), _ = cv2.getTextSize(text, font, scale, thick)
-    cx = (w - tw) // 2
-    cy = (h + th) // 2
+    ov   = frame.copy()
+    cv2.rectangle(ov, (0,0), (w, h), (0,0,0), cv2.FILLED)
+    frame = cv2.addWeighted(ov, 0.45, frame, 0.55, 0)
+    font  = cv2.FONT_HERSHEY_SIMPLEX
+    lbl   = "DETECTION PAUSED"
+    (tw,th),_ = cv2.getTextSize(lbl, font, 1.4, 3)
+    cx, cy    = (w-tw)//2, (h+th)//2
+    cv2.putText(frame, lbl, (cx+2,cy+2), font, 1.4, (0,0,0),    4, cv2.LINE_AA)
+    cv2.putText(frame, lbl, (cx,  cy),   font, 1.4, (0,200,255), 3, cv2.LINE_AA)
+    hint = "SPACE to resume  |  V for voice"
+    (sw,_),_ = cv2.getTextSize(hint, font, 0.55, 1)
+    cv2.putText(frame, hint, ((w-sw)//2, cy+52), font, 0.55,
+                (200,200,200), 1, cv2.LINE_AA)
+    return frame
 
-    # Shadow
-    cv2.putText(frame, text, (cx + 2, cy + 2), font, scale, (0, 0, 0), thick + 2, cv2.LINE_AA)
-    # Foreground
-    cv2.putText(frame, text, (cx, cy), font, scale, (0, 200, 255), thick, cv2.LINE_AA)
 
-    sub = "Press SPACE to resume"
-    (sw, _), _ = cv2.getTextSize(sub, font, 0.6, 1)
-    cv2.putText(frame, sub, ((w - sw) // 2, cy + 50), font, 0.6, (200, 200, 200), 1, cv2.LINE_AA)
+def draw_voice_badge(frame, on: bool):
+    h, w  = frame.shape[:2]
+    font  = cv2.FONT_HERSHEY_SIMPLEX
+    lbl   = "  MIC ON " if on else "  MIC OFF"
+    col   = (0,160,0) if on else (0,0,180)
+    (tw,th),_ = cv2.getTextSize(lbl, font, 0.50, 1)
+    x = w - tw - 16
+    y = 56
+    cv2.rectangle(frame, (x-4, y-th-5), (x+tw+4, y+5), col, cv2.FILLED)
+    cv2.putText(frame, lbl, (x, y), font, 0.50, (255,255,255), 1, cv2.LINE_AA)
+    return frame
+
+
+def draw_heard_strip(frame, heard: str, response: str):
+    """Show last heard command and last response at bottom of frame."""
+    if not heard and not response:
+        return frame
+    h, w  = frame.shape[:2]
+    font  = cv2.FONT_HERSHEY_SIMPLEX
+
+    # Response line (above)
+    if response:
+        resp_short = response[:110] + "…" if len(response) > 110 else response
+        msg = f"  AI: {resp_short}"
+        (tw,th),_ = cv2.getTextSize(msg, font, 0.46, 1)
+        y = h - 60
+        cv2.rectangle(frame, (0, y-th-6), (min(tw+12, w), y+4),
+                      (10,60,10), cv2.FILLED)
+        cv2.putText(frame, msg, (6, y), font, 0.46,
+                    (180,255,180), 1, cv2.LINE_AA)
+
+    # Heard line (bottom)
+    if heard:
+        msg = f"  You: {heard}"
+        (tw,th),_ = cv2.getTextSize(msg, font, 0.46, 1)
+        y = h - 42
+        cv2.rectangle(frame, (0, y-th-6), (min(tw+12, w), y+4),
+                      (10,10,60), cv2.FILLED)
+        cv2.putText(frame, msg, (6, y), font, 0.46,
+                    (180,200,255), 1, cv2.LINE_AA)
 
     return frame
 
 
-def _save_manual_screenshot(frame) -> None:
-    """Save a manually triggered screenshot."""
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = os.path.join("screenshots", f"manual_{ts}.jpg")
+def save_screenshot(frame, prefix="manual"):
+    os.makedirs("screenshots", exist_ok=True)
+    ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join("screenshots", f"{prefix}_{ts}.jpg")
     cv2.imwrite(path, frame)
-    print(f"[App] Manual screenshot → {path}")
+    print(f"[App] Screenshot → {path}")
 
 
-# ── Entry ─────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    args = build_args()
+    os.makedirs("screenshots", exist_ok=True)
+    os.makedirs("outputs",     exist_ok=True)
+
+    print()
+    print("=" * 65)
+    print("   AI Object Detection  +  Voice Assistant  (Person-Focused)")
+    print("=" * 65)
+    print(f"   Model   : {args.model}")
+    print(f"   Source  : {args.source}")
+    print(f"   Conf    : {args.conf:.0%}")
+    print(f"   Voice   : {'OFF' if args.no_voice else 'ON'}")
+    print()
+    print("   Voice commands:")
+    print("     'what do you see'              → all objects in frame")
+    print("     'describe the scene'           → full context description")
+    print("     'describe the person'          → person position + activity")
+    print("     'what is the person doing'     → activity detection")
+    print("     'where is the person'          → left / centre / right")
+    print("     'how close is the person'      → proximity estimate")
+    print("     'how old is the person'        → estimated age group")
+    print("     'is there a person'            → yes/no + detail")
+    print("     'how many persons'             → count")
+    print("     'count cars'                   → count any object")
+    print("     'are there any laptops'        → yes/no query")
+    print("     'start / stop detection'")
+    print("     'take a screenshot'")
+    print("     'increase / decrease confidence'")
+    print("     'help'                         → all commands")
+    print("=" * 65)
+    print()
+
+    # ── Detector ──────────────────────────────────────────────────────────────
+    detector = ObjectDetector(
+        model_path           = args.model,
+        confidence_threshold = args.conf,
+        screenshot_dir       = "screenshots",
+        screenshot_interval  = 30,
+    )
+
+    # ── Voice assistant ────────────────────────────────────────────────────────
+    detection_active = [True]
+
+    def on_start():
+        detection_active[0] = True
+
+    def on_stop():
+        detection_active[0] = False
+
+    def on_screenshot():
+        detector._last_shot = 0   # reset cooldown
+
+    assistant    = None
+    voice_active = False
+
+    if not args.no_voice:
+        class TrackedAssistant(VoiceAssistant):
+            def _handle(self, text):
+                if text:
+                    self.last_heard = text
+                resp = super()._handle(text)
+                if resp:
+                    self.last_response = resp
+                return resp
+
+        assistant = TrackedAssistant(
+            detector      = detector,
+            on_start      = on_start,
+            on_stop       = on_stop,
+            on_screenshot = on_screenshot,
+        )
+        assistant.start()
+        voice_active = True
+
+    # ── Video source ──────────────────────────────────────────────────────────
+    try:
+        src = int(args.source)
+    except (ValueError, TypeError):
+        src = str(args.source)
+
+    cap = cv2.VideoCapture(src)
+    if not cap.isOpened():
+        print(f"[App] ERROR: Cannot open source '{args.source}'")
+        sys.exit(1)
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  args.width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"[App] Capture: {W}×{H}")
+
+    # ── Window ────────────────────────────────────────────────────────────────
+    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WIN, W, H)
+
+    def _on_conf(val):
+        detector.set_confidence(val / 100.0)
+
+    cv2.createTrackbar("Confidence %", WIN,
+                       int(args.conf * 100), 95, _on_conf)
+
+    paused_frame = None
+
+    # ── Main loop ─────────────────────────────────────────────────────────────
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            if not isinstance(src, int) and os.path.isfile(str(src)):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
+            print("[App] Stream ended.")
+            break
+
+        if detection_active[0]:
+            display, _ = detector.process_frame(frame)
+            paused_frame = display.copy()
+        else:
+            display = draw_paused(
+                paused_frame if paused_frame is not None else frame
+            )
+
+        # Overlays
+        display = draw_voice_badge(display, voice_active)
+        if assistant:
+            display = draw_heard_strip(
+                display,
+                assistant.last_heard,
+                assistant.last_response,
+            )
+
+        cv2.imshow(WIN, display)
+
+        key = cv2.waitKey(1) & 0xFF
+
+        if key in (ord("q"), 27):
+            break
+        elif key == ord("s"):
+            save_screenshot(display)
+        elif key == ord(" "):
+            detection_active[0] = not detection_active[0]
+            print(f"[App] Detection {'RUNNING' if detection_active[0] else 'PAUSED'}.")
+        elif key == ord("v") and assistant:
+            if voice_active:
+                assistant.stop()
+                voice_active = False
+                print("[App] Voice OFF.")
+            else:
+                assistant.start()
+                voice_active = True
+                print("[App] Voice ON.")
+        elif key in (ord("+"), ord("=")):
+            detector.set_confidence(detector.confidence_threshold + 0.05)
+            cv2.setTrackbarPos("Confidence %", WIN,
+                               int(detector.confidence_threshold * 100))
+        elif key == ord("-"):
+            detector.set_confidence(detector.confidence_threshold - 0.05)
+            cv2.setTrackbarPos("Confidence %", WIN,
+                               int(detector.confidence_threshold * 100))
+        elif key == ord("0"):
+            detector.set_confidence(DEFAULT_CONF)
+            cv2.setTrackbarPos("Confidence %", WIN,
+                               int(DEFAULT_CONF * 100))
+
+        try:
+            if cv2.getWindowProperty(WIN, cv2.WND_PROP_VISIBLE) < 1:
+                break
+        except cv2.error:
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+    if assistant:
+        assistant.stop()
+    print("[App] Done.")
+
+
 if __name__ == "__main__":
     main()

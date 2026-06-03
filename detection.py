@@ -1,302 +1,505 @@
+"""
+detection.py — YOLOv8 Object Detector (Person-Focused)
+=======================================================
+- Detects all 80 COCO classes
+- Person gets EXTRA info: position in frame, size estimate, activity guess
+- Thread-safe current_counts for voice assistant
+- Rich HUD with person counter badge
+"""
 
 import cv2
 import numpy as np
 import time
 import os
+import threading
 from datetime import datetime
 from ultralytics import YOLO
 
-
-# ── Configuration ────────────────────────────────────────────────────────────
-
-# Objects this system focuses on (subset of COCO 80-class dataset)
-FOCUS_CLASSES = {
-    "person", "car", "bottle", "cell phone",
-    "chair", "laptop", "dog", "cat",
-    "bicycle", "motorcycle", "bus", "truck",
-    "cup", "book", "backpack",
+LABEL_COLOURS = {
+    "person":       (0,   230,   0),
+    "car":          (0,   140, 255),
+    "truck":        (0,   100, 200),
+    "bus":          (0,    80, 180),
+    "motorcycle":   (0,   200, 200),
+    "bicycle":      (50,  200, 255),
+    "bottle":       (0,     0, 255),
+    "cup":          (60,    0, 220),
+    "cell phone":   (255,   0, 230),
+    "laptop":       (255, 220,   0),
+    "tv":           (200, 180,   0),
+    "chair":        (0,   255, 255),
+    "couch":        (0,   200, 200),
+    "dining table": (0,   180, 180),
+    "dog":          (160, 100, 255),
+    "cat":          (200, 130, 255),
+    "book":         (200, 255, 100),
+    "backpack":     (120, 255, 180),
+    "handbag":      (100, 220, 160),
+    "mouse":        (255, 200, 100),
+    "keyboard":     (255, 180,  80),
+    "remote":       (255, 160,  60),
+    "clock":        (220, 220, 220),
+    "default":      (200, 200, 200),
 }
 
-# Auto-screenshot trigger: save frame when any of these appear
-IMPORTANT_OBJECTS = {"person", "car", "laptop", "cell phone"}
-
-# Colour palette for bounding boxes (BGR format for OpenCV)
-COLOURS = {
-    "person":      (0,   255,  0),    # green
-    "car":         (255, 165,  0),    # orange
-    "bottle":      (0,   0,   255),   # red
-    "cell phone":  (255, 0,   255),   # magenta
-    "chair":       (0,   255, 255),   # cyan
-    "laptop":      (255, 255,  0),    # yellow
-    "default":     (200, 200, 200),   # light grey
+SPOKEN_SYNONYMS = {
+    "people": "person",    "human": "person",     "humans": "person",
+    "man": "person",       "woman": "person",      "men": "person",
+    "women": "person",     "boy": "person",        "girl": "person",
+    "phone": "cell phone", "mobile": "cell phone", "smartphone": "cell phone",
+    "iphone": "cell phone","android": "cell phone",
+    "vehicle": "car",      "vehicles": "car",
+    "computer": "laptop",  "notebook": "laptop",   "macbook": "laptop",
+    "sofa": "couch",       "telly": "tv",          "television": "tv",
+    "mug": "cup",          "glass": "cup",
+    "bag": "backpack",     "purse": "handbag",
+    "bike": "bicycle",     "motorbike": "motorcycle",
 }
 
+IMPORTANT = {"person", "car", "laptop", "cell phone", "truck", "bus"}
 
-# ── ObjectDetector class ─────────────────────────────────────────────────────
+
+class PersonInfo:
+    """Stores per-person analysis: position, size, activity hint and age estimate."""
+    def __init__(self, x1, y1, x2, y2, frame_w, frame_h, nearby_objects):
+        self.x1, self.y1, self.x2, self.y2 = x1, y1, x2, y2
+        box_w  = x2 - x1
+        box_h  = y2 - y1
+        centre_x = (x1 + x2) / 2
+
+        # Position in frame
+        if centre_x < frame_w * 0.33:
+            self.position = "on the left"
+        elif centre_x > frame_w * 0.66:
+            self.position = "on the right"
+        else:
+            self.position = "in the centre"
+
+        # Size → proximity estimate
+        area_ratio = (box_w * box_h) / (frame_w * frame_h)
+        if area_ratio > 0.35:
+            self.proximity = "very close"
+        elif area_ratio > 0.15:
+            self.proximity = "nearby"
+        elif area_ratio > 0.05:
+            self.proximity = "at mid distance"
+        else:
+            self.proximity = "far away"
+
+        # Activity guess from nearby objects
+        if "cell phone" in nearby_objects:
+            self.activity = "using a phone"
+        elif "laptop" in nearby_objects:
+            self.activity = "working on a laptop"
+        elif "book" in nearby_objects:
+            self.activity = "reading"
+        elif "cup" in nearby_objects:
+            self.activity = "holding a cup"
+        elif "tv" in nearby_objects:
+            self.activity = "watching TV"
+        elif "bicycle" in nearby_objects or "motorcycle" in nearby_objects:
+            self.activity = "near a vehicle"
+        else:
+            self.activity = None
+
+        # Age estimate from apparent height ratio
+        height_ratio = box_h / frame_h
+        if height_ratio >= 0.60:
+            self.age_group = "an adult"
+        elif height_ratio >= 0.45:
+            self.age_group = "a teenager"
+        elif height_ratio >= 0.28:
+            self.age_group = "a child"
+        else:
+            self.age_group = "a young child"
+
 
 class ObjectDetector:
     """
-    Wraps YOLOv8 inference with drawing helpers, FPS tracking,
-    object counting, and automatic screenshot saving.
-
-    Usage:
-        detector = ObjectDetector()
-        annotated_frame, counts = detector.process_frame(frame)
+    Thread-safe YOLOv8 wrapper with person-focused analysis.
     """
 
     def __init__(
         self,
-        model_path: str = "yolov8n.pt",
-        confidence_threshold: float = 0.40,
-        screenshot_dir: str = "screenshots",
-        screenshot_interval: int = 30,   # seconds between auto-screenshots
+        model_path           = "yolov8n.pt",
+        confidence_threshold = 0.35,
+        screenshot_dir       = "screenshots",
+        screenshot_interval  = 30,
     ):
-        """
-        Parameters
-        ----------
-        model_path           : Path to YOLOv8 weights (.pt file).
-                               If not found locally, Ultralytics downloads it.
-        confidence_threshold : Minimum confidence to keep a detection (0–1).
-        screenshot_dir       : Directory where auto-screenshots are saved.
-        screenshot_interval  : Minimum seconds between automatic screenshots.
-        """
         self.confidence_threshold = confidence_threshold
-        self.screenshot_dir = screenshot_dir
-        self.screenshot_interval = screenshot_interval
+        self.screenshot_dir       = screenshot_dir
+        self.screenshot_interval  = screenshot_interval
 
-        # FPS tracking state
-        self._fps_start_time = time.time()
-        self._fps_frame_count = 0
+        self._fps_start  = time.time()
+        self._fps_frames = 0
         self.current_fps = 0.0
+        self._last_shot  = 0.0
 
-        # Screenshot cooldown
-        self._last_screenshot_time = 0.0
+        self._lock           = threading.Lock()
+        self.current_counts  = {}
+        self.scene_objects   = []
+        self.person_details  = []   # list[PersonInfo]
 
-        # Latest detection results (shared with voice assistant)
-        self.current_counts: dict[str, int] = {}
-        self.scene_objects: list[str] = []
-
-        # ── Load YOLOv8 model ──────────────────────────────────────────────
-        print(f"[Detector] Loading model: {model_path}")
-        self.model = YOLO(model_path)          # downloads automatically if absent
-        self.class_names = self.model.names    # {0: 'person', 1: 'bicycle', ...}
-        print(f"[Detector] Model loaded — {len(self.class_names)} classes available.")
-
+        print(f"[Detector] Loading {model_path} …")
+        self.model       = YOLO(model_path)
+        self.class_names = self.model.names
+        print(f"[Detector] Ready — {len(self.class_names)} COCO classes.")
         os.makedirs(screenshot_dir, exist_ok=True)
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    # ── Main API ──────────────────────────────────────────────────────────────
 
-    def process_frame(self, frame: np.ndarray) -> tuple[np.ndarray, dict[str, int]]:
-        """
-        Run YOLOv8 detection on one frame.
+    def process_frame(self, frame: np.ndarray):
+        self._tick_fps()
+        h, w = frame.shape[:2]
 
-        Returns
-        -------
-        annotated_frame : Frame with bounding boxes, labels, FPS overlay.
-        object_counts   : {class_name: count} for all detected objects.
-        """
-        self._update_fps()
+        results = self.model.predict(
+            frame, conf=self.confidence_threshold,
+            verbose=False, stream=False,
+        )
 
-        # ── YOLOv8 inference ───────────────────────────────────────────────
-        # verbose=False suppresses per-frame console output
-        results = self.model(frame, conf=self.confidence_threshold, verbose=False)
-
-        # ── Parse detections ───────────────────────────────────────────────
-        object_counts: dict[str, int] = {}
-        detections = []  # list of (x1,y1,x2,y2,label,conf,colour)
+        counts       = {}
+        detections   = []
+        person_boxes = []
+        other_labels = set()
 
         for result in results:
-            boxes = result.boxes
-            if boxes is None:
+            if result.boxes is None:
                 continue
-            for box in boxes:
-                class_id   = int(box.cls[0])
-                label      = self.class_names[class_id]
-                confidence = float(box.conf[0])
+            for box in result.boxes:
+                cid   = int(box.cls[0].item())
+                label = self.class_names.get(cid, f"obj{cid}")
+                conf  = float(box.conf[0].item())
+                x1,y1,x2,y2 = (int(v) for v in box.xyxy[0].tolist())
+                colour = LABEL_COLOURS.get(label, LABEL_COLOURS["default"])
+                detections.append((x1, y1, x2, y2, label, conf, colour))
+                counts[label] = counts.get(label, 0) + 1
+                if label == "person":
+                    person_boxes.append((x1, y1, x2, y2))
+                else:
+                    other_labels.add(label)
 
-                # Only keep classes we care about OR all if focus list is empty
-                if FOCUS_CLASSES and label not in FOCUS_CLASSES:
-                    continue
+        # Build person analysis
+        persons = [
+            PersonInfo(x1, y1, x2, y2, w, h, other_labels)
+            for (x1, y1, x2, y2) in person_boxes
+        ]
 
-                # Bounding-box pixel coordinates
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                colour = COLOURS.get(label, COLOURS["default"])
+        with self._lock:
+            self.current_counts = dict(counts)
+            self.scene_objects  = list(counts.keys())
+            self.person_details = persons
 
-                detections.append((x1, y1, x2, y2, label, confidence, colour))
-                object_counts[label] = object_counts.get(label, 0) + 1
-
-        # ── Update shared state (for voice assistant) ──────────────────────
-        self.current_counts = object_counts
-        self.scene_objects  = list(object_counts.keys())
-
-        # ── Draw everything on a copy of the frame ─────────────────────────
-        annotated = frame.copy()
+        # Draw
+        out = frame.copy()
         for det in detections:
-            annotated = self._draw_detection(annotated, *det)
+            if det[4] == "person":
+                out = self._draw_person_box(out, *det)
+            else:
+                out = self._draw_box(out, *det)
+        out = self._draw_hud(out, counts)
 
-        annotated = self._draw_hud(annotated, object_counts)
+        if self._should_screenshot(counts):
+            self._save_screenshot(out)
 
-        # ── Auto-screenshot trigger ────────────────────────────────────────
-        if self._should_screenshot(object_counts):
-            self._save_screenshot(annotated)
+        return out, counts
 
-        return annotated, object_counts
+    # ── Scene descriptions ────────────────────────────────────────────────────
 
     def get_scene_description(self) -> str:
         """
-        Build a natural-language description of the current scene.
-        Example: "I can see 2 persons, 1 laptop, and 1 bottle."
+        Returns a natural spoken sentence.
+        e.g. "I can see a person and a cell phone in the frame."
         """
-        counts = self.current_counts
+        with self._lock:
+            counts  = dict(self.current_counts)
+            persons = list(self.person_details)
+
         if not counts:
-            return "I don't see any recognizable objects right now."
+            return "I don't see any objects in the frame right now."
 
         parts = []
-        for label, count in sorted(counts.items()):
-            noun = label if count == 1 else self._pluralize(label)
-            parts.append(f"{count} {noun}")
+        for label in sorted(counts):
+            n = counts[label]
+            if n == 1:
+                art = "an" if label[0].lower() in "aeiou" else "a"
+                parts.append(f"{art} {label}")
+            else:
+                parts.append(f"{n} {_pluralize(label)}")
 
         if len(parts) == 1:
-            return f"I can see {parts[0]}."
+            base = f"I can see {parts[0]} in the frame."
         elif len(parts) == 2:
-            return f"I can see {parts[0]} and {parts[1]}."
+            base = f"I can see {parts[0]} and {parts[1]} in the frame."
         else:
-            return f"I can see {', '.join(parts[:-1])}, and {parts[-1]}."
+            base = f"I can see {', '.join(parts[:-1])}, and {parts[-1]} in the frame."
 
-    def get_count(self, object_name: str) -> int:
-        """Return the count of a specific object in the current frame."""
-        # Handle common spoken variants
-        name_map = {
-            "phone":  "cell phone",
-            "mobile": "cell phone",
-            "people": "person",
-            "human":  "person",
-            "humans": "person",
-        }
-        key = name_map.get(object_name.lower(), object_name.lower())
-        return self.current_counts.get(key, 0)
+        return base
 
-    def set_confidence(self, threshold: float) -> None:
-        """Dynamically adjust the confidence threshold."""
-        self.confidence_threshold = max(0.05, min(0.95, threshold))
-        print(f"[Detector] Confidence threshold → {self.confidence_threshold:.2f}")
+    def get_detailed_description(self) -> str:
+        """
+        Full description with person analysis.
+        e.g. "I can see a person and a cell phone in the frame.
+               The person is in the centre of the frame, nearby,
+               and appears to be using a phone."
+        """
+        with self._lock:
+            counts  = dict(self.current_counts)
+            persons = list(self.person_details)
 
-    # ── Internal helpers ──────────────────────────────────────────────────────
+        if not counts:
+            return "The frame is empty. I don't see any objects right now."
 
-    def _draw_detection(
-        self,
-        frame: np.ndarray,
-        x1: int, y1: int, x2: int, y2: int,
-        label: str, confidence: float,
-        colour: tuple,
-    ) -> np.ndarray:
-        """Draw one bounding box with a filled label strip."""
-        thickness = 2
+        base    = self.get_scene_description()
+        context = _build_context(counts, persons)
+        return (base + "  " + context).strip() if context else base
 
-        # Bounding box rectangle
-        cv2.rectangle(frame, (x1, y1), (x2, y2), colour, thickness)
+    def get_person_description(self) -> str:
+        """
+        Dedicated person report.
+        e.g. "I can see 2 persons. Person 1 is on the left, nearby,
+               and appears to be using a phone. Person 2 is on the right,
+               at mid distance."
+        """
+        with self._lock:
+            counts  = dict(self.current_counts)
+            persons = list(self.person_details)
 
-        # Label text: "person 0.92"
-        text = f"{label} {confidence:.2f}"
-        font       = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.55
-        font_thick = 1
+        n = counts.get("person", 0)
+        if n == 0:
+            return "I don't see any person in the frame right now."
 
-        (tw, th), baseline = cv2.getTextSize(text, font, font_scale, font_thick)
+        if n == 1:
+            p   = persons[0] if persons else None
+            msg = "I can see 1 person in the frame."
+            if p:
+                msg += f" The person is {p.position}, {p.proximity}, and appears to be {p.age_group}."
+                if p.activity:
+                    msg += f" They appear to be {p.activity}."
+        else:
+            msg = f"I can see {n} persons in the frame."
+            details = []
+            for i, p in enumerate(persons[:4], 1):   # cap at 4
+                d = f"Person {i} is {p.position}, {p.proximity}, and appears to be {p.age_group}"
+                if p.activity:
+                    d += f", and appears to be {p.activity}"
+                details.append(d + ".")
+            if details:
+                msg += " " + " ".join(details)
 
-        # Filled rectangle behind label for readability
-        label_y = max(y1 - th - 8, 0)
-        cv2.rectangle(
-            frame,
-            (x1, label_y),
-            (x1 + tw + 6, label_y + th + 8),
-            colour,
-            cv2.FILLED,
-        )
+        return msg
 
-        # White text on coloured background
-        cv2.putText(
-            frame, text,
-            (x1 + 3, label_y + th + 2),
-            font, font_scale, (255, 255, 255), font_thick,
-            cv2.LINE_AA,
-        )
-        return frame
+    def get_count(self, spoken_name: str) -> int:
+        key = spoken_name.strip().lower()
+        key = SPOKEN_SYNONYMS.get(key, key)
+        with self._lock:
+            return self.current_counts.get(key, 0)
 
-    def _draw_hud(self, frame: np.ndarray, counts: dict[str, int]) -> np.ndarray:
-        """Draw the heads-up display: FPS, object summary, controls hint."""
-        h, w = frame.shape[:2]
-        overlay = frame.copy()
+    def set_confidence(self, v: float):
+        self.confidence_threshold = max(0.05, min(0.95, float(v)))
+        print(f"[Detector] Confidence → {self.confidence_threshold:.0%}")
 
-        # Semi-transparent dark sidebar on the left
-        cv2.rectangle(overlay, (0, 0), (220, h), (20, 20, 20), cv2.FILLED)
-        frame = cv2.addWeighted(overlay, 0.45, frame, 0.55, 0)
+    # ── Drawing ───────────────────────────────────────────────────────────────
+
+    def _draw_person_box(self, frame, x1, y1, x2, y2, label, conf, colour):
+        """Person gets a thicker box + activity and age labels if available."""
+        with self._lock:
+            persons = list(self.person_details)
+
+        # Find matching PersonInfo by box coordinates
+        activity = None
+        age_group = None
+        for p in persons:
+            if abs(p.x1 - x1) < 10 and abs(p.y1 - y1) < 10:
+                activity = p.activity
+                age_group = p.age_group
+                break
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 3)   # thicker
+
+        text  = f"person  {conf:.0%}"
+        if age_group:
+            age_label = age_group.replace("an ", "").replace("a ", "").strip()
+            text += f"  [{age_label}]"
+        if activity:
+            text += f"  [{activity}]"
 
         font  = cv2.FONT_HERSHEY_SIMPLEX
-        small = 0.48
-        mid   = 0.55
-        white = (255, 255, 255)
-        green = (80, 255, 80)
-        gold  = (0, 215, 255)
+        scale = 0.56
+        (tw, th), _ = cv2.getTextSize(text, font, scale, 1)
+        ty = max(y1 - 4, th + 6)
+        cv2.rectangle(frame, (x1, ty - th - 6), (x1 + tw + 8, ty + 2),
+                      colour, cv2.FILLED)
+        cv2.putText(frame, text, (x1 + 4, ty - 2),
+                    font, scale, (0, 0, 0), 1, cv2.LINE_AA)
 
-        # Title
-        cv2.putText(frame, "AI DETECTOR", (8, 28), font, 0.65, gold, 2, cv2.LINE_AA)
-        cv2.line(frame, (8, 36), (212, 36), (80, 80, 80), 1)
-
-        # FPS
-        fps_colour = (0, 255, 0) if self.current_fps > 20 else (0, 165, 255)
-        cv2.putText(frame, f"FPS: {self.current_fps:.1f}", (8, 58), font, mid, fps_colour, 1, cv2.LINE_AA)
-
-        # Object counts
-        cv2.putText(frame, "Objects:", (8, 82), font, small, gold, 1, cv2.LINE_AA)
-        y = 102
-        if counts:
-            for obj, cnt in sorted(counts.items()):
-                cv2.putText(frame, f"  {obj}: {cnt}", (8, y), font, small, white, 1, cv2.LINE_AA)
-                y += 20
-        else:
-            cv2.putText(frame, "  none detected", (8, y), font, small, (150, 150, 150), 1, cv2.LINE_AA)
-            y += 20
-
-        # Keyboard shortcuts at the bottom
-        hints = ["Q - quit", "S - screenshot", "+/- conf", "V - voice"]
-        y_hint = h - len(hints) * 20 - 10
-        cv2.line(frame, (8, y_hint - 8), (212, y_hint - 8), (80, 80, 80), 1)
-        for hint in hints:
-            cv2.putText(frame, hint, (8, y_hint), font, 0.42, (180, 180, 180), 1, cv2.LINE_AA)
-            y_hint += 20
+        # Small filled circle at the head area
+        head_y = max(y1 - 14, 14)
+        cx     = (x1 + x2) // 2
+        cv2.circle(frame, (cx, head_y), 10, colour, cv2.FILLED)
+        cv2.circle(frame, (cx, head_y), 10, (0, 0, 0), 1)
 
         return frame
 
-    def _update_fps(self) -> None:
-        """Compute rolling FPS every 30 frames."""
-        self._fps_frame_count += 1
-        if self._fps_frame_count >= 30:
-            elapsed = time.time() - self._fps_start_time
-            self.current_fps = self._fps_frame_count / elapsed if elapsed > 0 else 0
-            self._fps_frame_count = 0
-            self._fps_start_time = time.time()
+    def _draw_box(self, frame, x1, y1, x2, y2, label, conf, colour):
+        cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 2)
+        text  = f"{label}  {conf:.0%}"
+        font  = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.55
+        (tw, th), _ = cv2.getTextSize(text, font, scale, 1)
+        ty = max(y1 - 4, th + 6)
+        cv2.rectangle(frame, (x1, ty - th - 6), (x1 + tw + 8, ty + 2),
+                      colour, cv2.FILLED)
+        cv2.putText(frame, text, (x1 + 4, ty - 2),
+                    font, scale, (255, 255, 255), 1, cv2.LINE_AA)
+        return frame
 
-    def _should_screenshot(self, counts: dict[str, int]) -> bool:
-        """Return True if an important object is detected and cooldown has passed."""
+    def _draw_hud(self, frame, counts):
+        h, w  = frame.shape[:2]
+        font  = cv2.FONT_HERSHEY_SIMPLEX
+        GOLD  = (0, 215, 255)
+        GREEN = (0, 230, 0)
+        WHITE = (255, 255, 255)
+
+        # Title bar top
+        ov = frame.copy()
+        cv2.rectangle(ov, (0, 0), (w, 32), (10, 10, 10), cv2.FILLED)
+        frame = cv2.addWeighted(ov, 0.75, frame, 0.25, 0)
+        cv2.putText(frame, "AI OBJECT DETECTION  |  YOLOv8n",
+                    (8, 22), font, 0.54, GOLD, 1, cv2.LINE_AA)
+
+        # Person badge top-right (prominent)
+        n_persons = counts.get("person", 0)
+        badge_txt = f"PERSONS: {n_persons}"
+        badge_col = (0, 200, 0) if n_persons > 0 else (60, 60, 60)
+        (bw, bh), _ = cv2.getTextSize(badge_txt, font, 0.56, 2)
+        bx = w - bw - 20
+        by = 22
+        cv2.rectangle(frame, (bx - 8, by - bh - 5),
+                      (bx + bw + 8, by + 5), (20, 20, 20), cv2.FILLED)
+        cv2.putText(frame, badge_txt, (bx, by),
+                    font, 0.56, badge_col, 2, cv2.LINE_AA)
+
+        # Bottom strip
+        ov2 = frame.copy()
+        cv2.rectangle(ov2, (0, h - 38), (w, h), (10, 10, 10), cv2.FILLED)
+        frame = cv2.addWeighted(ov2, 0.75, frame, 0.25, 0)
+
+        fps_col = GREEN if self.current_fps > 20 else (0, 140, 255)
+        cv2.putText(frame, f"FPS {self.current_fps:.0f}",
+                    (10, h - 12), font, 0.52, fps_col, 1, cv2.LINE_AA)
+
+        if counts:
+            obj_str = "  |  ".join(
+                f"{lbl}: {cnt}" for lbl, cnt in sorted(counts.items())
+            )
+        else:
+            obj_str = "No objects detected"
+        (ow, _), _ = cv2.getTextSize(obj_str, font, 0.47, 1)
+        cv2.putText(frame, obj_str,
+                    (max(90, (w - ow) // 2), h - 12),
+                    font, 0.47, GOLD, 1, cv2.LINE_AA)
+
+        tip = f"Conf {self.confidence_threshold:.0%}   Q=quit  S=snap  V=voice  SPACE=pause"
+        (cw, _), _ = cv2.getTextSize(tip, font, 0.38, 1)
+        cv2.putText(frame, tip, (w - cw - 8, h - 12),
+                    font, 0.38, (160, 160, 160), 1, cv2.LINE_AA)
+
+        return frame
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _tick_fps(self):
+        self._fps_frames += 1
+        if self._fps_frames >= 20:
+            elapsed = time.time() - self._fps_start
+            self.current_fps = self._fps_frames / elapsed if elapsed else 0
+            self._fps_frames = 0
+            self._fps_start  = time.time()
+
+    def _should_screenshot(self, counts):
         now = time.time()
-        has_important = any(obj in IMPORTANT_OBJECTS for obj in counts)
-        cooldown_ok   = (now - self._last_screenshot_time) >= self.screenshot_interval
-        return has_important and cooldown_ok
+        return (
+            any(k in IMPORTANT for k in counts)
+            and (now - self._last_shot) >= self.screenshot_interval
+        )
 
-    def _save_screenshot(self, frame: np.ndarray) -> None:
-        """Save a timestamped screenshot."""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename  = os.path.join(self.screenshot_dir, f"detect_{timestamp}.jpg")
-        cv2.imwrite(filename, frame)
-        self._last_screenshot_time = time.time()
-        print(f"[Detector] Screenshot saved → {filename}")
+    def _save_screenshot(self, frame):
+        ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(self.screenshot_dir, f"detect_{ts}.jpg")
+        cv2.imwrite(path, frame)
+        self._last_shot = time.time()
+        print(f"[Detector] Auto-screenshot → {path}")
 
-    @staticmethod
-    def _pluralize(word: str) -> str:
-        """Very simple English pluraliser."""
-        if word.endswith("s"):
-            return word
-        if word.endswith("son"):   # person → persons (not peopleson)
-            return word + "s"
-        return word + "s"
+
+# ── Module helpers ────────────────────────────────────────────────────────────
+
+def _pluralize(word: str) -> str:
+    IRR = {"person": "persons", "mouse": "mice",
+           "sheep": "sheep",    "fish":  "fish"}
+    if word in IRR:
+        return IRR[word]
+    if word.endswith(("s", "sh", "ch", "x", "z")):
+        return word + "es"
+    if word.endswith("y") and len(word) > 1 and word[-2] not in "aeiou":
+        return word[:-1] + "ies"
+    return word + "s"
+
+
+def _build_context(counts: dict, persons: list) -> str:
+    """
+    Build a contextual sentence from detected objects + person analysis.
+    Called by get_detailed_description().
+    """
+    has = counts.get
+
+    if has("person") and has("cell phone"):
+        p  = has("person")
+        ph = has("cell phone")
+        who = "a person" if p == 1 else f"{p} persons"
+        phn = "a cell phone" if ph == 1 else f"{ph} cell phones"
+        verb = "is" if p == 1 else "are"
+        return f"It looks like {who} {verb} holding {phn}."
+
+    if has("person") and has("laptop"):
+        p    = has("person")
+        who  = "someone" if p == 1 else f"{p} people"
+        verb = "is" if p == 1 else "are"
+        return f"It looks like {who} {verb} working on a laptop."
+
+    if has("person") and has("tv"):
+        p    = has("person")
+        who  = "someone" if p == 1 else f"{p} people"
+        verb = "is" if p == 1 else "are"
+        return f"It looks like {who} {verb} watching TV."
+
+    if has("person") and has("book"):
+        p    = has("person")
+        who  = "someone" if p == 1 else f"{p} people"
+        verb = "is" if p == 1 else "are"
+        return f"It looks like {who} {verb} reading a book."
+
+    if has("person") and has("cup"):
+        p    = has("person")
+        who  = "someone" if p == 1 else f"{p} people"
+        verb = "is" if p == 1 else "are"
+        return f"It looks like {who} {verb} holding a cup."
+
+    if has("person", 0) > 2:
+        return f"There are {has('person')} persons visible in the frame."
+
+    if has("person") and len(counts) == 1:
+        p = has("person")
+        return ("There is a person standing in the frame."
+                if p == 1 else
+                f"There are {p} persons standing in the frame.")
+
+    cars = has("car", 0) + has("truck", 0) + has("bus", 0)
+    if cars >= 3:
+        return "There is significant vehicle traffic visible."
+    if cars >= 1 and not has("person"):
+        return "I can see vehicles but no people in the frame."
+
+    if has("bottle") and not has("person"):
+        return "I can see a bottle but no person is holding it."
+
+    return ""
